@@ -72,7 +72,7 @@ class ParameterRegistry:
         self._document = document
         self._key = key
         self._history_limit = max(1, int(history_limit))
-        self._current: ParameterSet | None = self._load()
+        self._history: list[ParameterSet] = self._load()
 
     @property
     def key(self) -> str:
@@ -80,11 +80,11 @@ class ParameterRegistry:
 
     @property
     def generation(self) -> int:
-        return 0 if self._current is None else self._current.generation
+        return 0 if not self._history else self._history[-1].generation
 
     @property
     def published_count(self) -> int:
-        return 0 if self._current is None else 1
+        return len(self._history)
 
     def publish(
         self,
@@ -108,7 +108,8 @@ class ParameterRegistry:
             published_at=float(published_at),
             author=str(author),
         )
-        self._persist(parameter_set)
+        self._history = [*self._history, parameter_set][-self._history_limit :]
+        self._persist()
         self._stream.put(
             self._key,
             parameter_set.as_dict(),
@@ -117,53 +118,65 @@ class ParameterRegistry:
             reason=reason,
         )
         self._stream.commit(committed_at=published_at)
-        self._current = parameter_set
         return parameter_set
 
     def current(self) -> ParameterSet:
-        if self._current is None:
+        if not self._history:
             raise NotFoundError("no parameter generation has been published yet")
-        return self._current
+        return self._history[-1]
 
     def get(self, generation: int) -> ParameterSet:
-        if self._current is not None and self._current.generation == int(generation):
-            return self._current
-        raise NotFoundError("unknown parameter generation", generation=int(generation))
+        wanted = int(generation)
+        for parameter_set in reversed(self._history):
+            if parameter_set.generation == wanted:
+                return parameter_set
+        raise NotFoundError("unknown parameter generation", generation=wanted)
 
     def history(self) -> list[ParameterSet]:
-        return [] if self._current is None else [self._current]
+        return list(self._history)
 
     def is_current(self, generation: int) -> bool:
-        return self._current is not None and self._current.generation == int(generation)
+        return bool(self._history) and self._history[-1].generation == int(generation)
 
     def age_seconds(self, now: float) -> float:
         return max(0.0, float(now) - self.current().published_at)
 
     def restore(self, records: Sequence[LedgerRecord]) -> ParameterSet | None:
-        """Rebuild the published parameter set from a ledger replay."""
+        """Rebuild the published history from a ledger replay."""
 
-        latest: ParameterSet | None = None
+        by_generation: dict[int, ParameterSet] = {}
         for record in records:
             if record.key != self._key or record.is_tombstone:
                 continue
             candidate = ParameterSet.from_dict(record.payload)
-            if latest is None or candidate.generation >= latest.generation:
-                latest = candidate
-        if latest is None:
+            by_generation[candidate.generation] = candidate
+        if not by_generation:
             return None
-        self._current = latest
-        return latest
+        ordered = [by_generation[number] for number in sorted(by_generation)]
+        self._history = ordered[-self._history_limit :]
+        return self._history[-1]
 
-    def _persist(self, parameter_set: ParameterSet) -> None:
-        payload = {"current": parameter_set.as_dict()}
-        written_at = float(parameter_set.published_at)
-        self._store.write(self._document, payload, written_at=written_at)
+    def _persist(self) -> None:
+        current = self._history[-1]
+        payload = {
+            "current": current.as_dict(),
+            "history": [item.as_dict() for item in self._history],
+        }
+        self._store.write(self._document, payload, written_at=float(current.published_at))
 
-    def _load(self) -> ParameterSet | None:
+    def _load(self) -> list[ParameterSet]:
         document = self._store.read_or_none(self._document)
         if document is None:
-            return None
+            return []
+        raw_history = document.data.get("history")
+        if isinstance(raw_history, list):
+            entries = [
+                ParameterSet.from_dict(item) for item in raw_history if isinstance(item, Mapping)
+            ]
+            entries.sort(key=lambda item: item.generation)
+            return entries[-self._history_limit :]
+        # Documents written before the history list existed carry only "current".
         current = document.data.get("current")
         if not isinstance(current, Mapping):
-            return None
-        return ParameterSet.from_dict(current)
+            return []
+        return [ParameterSet.from_dict(current)]

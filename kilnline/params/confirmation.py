@@ -35,6 +35,8 @@ class Confirmation:
     issued_at: float
     expires_at: float
     issued_by: str
+    parameter_generation: int = 0
+    digest: str = ""
     revoked_at: float | None = None
 
     def age_seconds(self, now: float) -> float:
@@ -53,6 +55,8 @@ class Confirmation:
             "issued_at": float(self.issued_at),
             "expires_at": float(self.expires_at),
             "issued_by": self.issued_by,
+            "parameter_generation": int(self.parameter_generation),
+            "digest": self.digest,
         }
         if self.revoked_at is not None:
             payload["revoked_at"] = float(self.revoked_at)
@@ -67,6 +71,8 @@ class Confirmation:
             issued_at=float(payload.get("issued_at", 0.0)),
             expires_at=float(payload.get("expires_at", 0.0)),
             issued_by=str(payload.get("issued_by", "")),
+            parameter_generation=int(payload.get("parameter_generation", 0)),
+            digest=str(payload.get("digest", "")),
             revoked_at=None if revoked is None else float(revoked),
         )
 
@@ -121,6 +127,8 @@ class ConfirmationBook:
             issued_at=float(issued_at),
             expires_at=float(issued_at) + lifetime,
             issued_by=str(issued_by),
+            parameter_generation=int(parameter_set.generation),
+            digest=parameter_set.digest,
         )
         self._entries = [entry for entry in self._entries if entry.token != token]
         self._entries.append(confirmation)
@@ -150,6 +158,16 @@ class ConfirmationBook:
                 now=float(now),
                 age_s=confirmation.age_seconds(now),
             )
+        if parameter_set is not None and (
+            confirmation.parameter_generation != parameter_set.generation
+            or confirmation.digest != parameter_set.digest
+        ):
+            raise GenerationMismatch(
+                "confirmation slip was issued for a superseded parameter generation",
+                token=confirmation.token,
+                slip_generation=confirmation.parameter_generation,
+                current_generation=int(parameter_set.generation),
+            )
         if scope is not None and str(scope) != confirmation.scope:
             raise ValidationError(
                 "confirmation slip was issued for a different scope",
@@ -167,6 +185,8 @@ class ConfirmationBook:
             issued_at=confirmation.issued_at,
             expires_at=confirmation.expires_at,
             issued_by=confirmation.issued_by,
+            parameter_generation=confirmation.parameter_generation,
+            digest=confirmation.digest,
             revoked_at=float(at),
         )
         self._entries = [revoked if entry.token == revoked.token else entry for entry in self._entries]
@@ -202,6 +222,8 @@ class ConfirmationBook:
             "issued_at": issued_at,
             "issued_by": issued_by,
             "issued": len(self._entries),
+            "parameter_generation": int(parameter_set.generation),
+            "parameter_digest": parameter_set.digest,
         }
         return f"CF-{digest_of(material)[:16].upper()}"
 
