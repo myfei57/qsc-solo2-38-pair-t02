@@ -72,7 +72,8 @@ class ParameterRegistry:
         self._document = document
         self._key = key
         self._history_limit = max(1, int(history_limit))
-        self._current: ParameterSet | None = self._load()
+        self._generations: list[ParameterSet] = self._load()
+        self._current: ParameterSet | None = self._generations[-1] if self._generations else None
 
     @property
     def key(self) -> str:
@@ -84,7 +85,7 @@ class ParameterRegistry:
 
     @property
     def published_count(self) -> int:
-        return 0 if self._current is None else 1
+        return len(self._generations)
 
     def publish(
         self,
@@ -118,6 +119,8 @@ class ParameterRegistry:
         )
         self._stream.commit(committed_at=published_at)
         self._current = parameter_set
+        self._generations.append(parameter_set)
+        self._generations = self._generations[-self._history_limit :]
         return parameter_set
 
     def current(self) -> ParameterSet:
@@ -126,12 +129,16 @@ class ParameterRegistry:
         return self._current
 
     def get(self, generation: int) -> ParameterSet:
-        if self._current is not None and self._current.generation == int(generation):
-            return self._current
-        raise NotFoundError("unknown parameter generation", generation=int(generation))
+        wanted = int(generation)
+        for parameter_set in self._generations:
+            if parameter_set.generation == wanted:
+                return parameter_set
+        raise NotFoundError("unknown parameter generation", generation=wanted)
 
     def history(self) -> list[ParameterSet]:
-        return [] if self._current is None else [self._current]
+        """Every retained generation, oldest first."""
+
+        return list(self._generations)
 
     def is_current(self, generation: int) -> bool:
         return self._current is not None and self._current.generation == int(generation)
@@ -140,30 +147,44 @@ class ParameterRegistry:
         return max(0.0, float(now) - self.current().published_at)
 
     def restore(self, records: Sequence[LedgerRecord]) -> ParameterSet | None:
-        """Rebuild the published parameter set from a ledger replay."""
+        """Rebuild every published parameter generation from a ledger replay."""
 
-        latest: ParameterSet | None = None
+        recovered: dict[int, ParameterSet] = {
+            parameter_set.generation: parameter_set for parameter_set in self._generations
+        }
         for record in records:
             if record.key != self._key or record.is_tombstone:
                 continue
             candidate = ParameterSet.from_dict(record.payload)
-            if latest is None or candidate.generation >= latest.generation:
-                latest = candidate
-        if latest is None:
-            return None
-        self._current = latest
-        return latest
+            recovered[candidate.generation] = candidate
+        generations = sorted(recovered.values(), key=lambda parameter_set: parameter_set.generation)
+        self._generations = generations[-self._history_limit :]
+        self._current = self._generations[-1] if self._generations else None
+        return self._current
 
     def _persist(self, parameter_set: ParameterSet) -> None:
-        payload = {"current": parameter_set.as_dict()}
+        retained = self._generations[-self._history_limit + 1 :] + [parameter_set]
+        payload = {"current": parameter_set.as_dict(), "generations": [item.as_dict() for item in retained]}
         written_at = float(parameter_set.published_at)
         self._store.write(self._document, payload, written_at=written_at)
 
-    def _load(self) -> ParameterSet | None:
+    def _load(self) -> list[ParameterSet]:
         document = self._store.read_or_none(self._document)
         if document is None:
-            return None
-        current = document.data.get("current")
-        if not isinstance(current, Mapping):
-            return None
-        return ParameterSet.from_dict(current)
+            return []
+        raw = document.data.get("generations")
+        if not isinstance(raw, list):
+            # Backwards compatibility: older documents only carried "current".
+            raw = [document.data.get("current")]
+        generations: list[ParameterSet] = []
+        seen: set[int] = set()
+        for entry in raw:
+            if not isinstance(entry, Mapping):
+                continue
+            parameter_set = ParameterSet.from_dict(entry)
+            if parameter_set.generation in seen:
+                continue
+            generations.append(parameter_set)
+            seen.add(parameter_set.generation)
+        generations.sort(key=lambda parameter_set: parameter_set.generation)
+        return generations[-self._history_limit :]

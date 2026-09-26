@@ -32,6 +32,8 @@ class Confirmation:
 
     token: str
     scope: str
+    parameter_generation: int
+    digest: str
     issued_at: float
     expires_at: float
     issued_by: str
@@ -46,10 +48,20 @@ class Confirmation:
     def revoked(self) -> bool:
         return self.revoked_at is not None
 
+    def binds(self, parameter_set: ParameterSet) -> bool:
+        """True when the slip was signed against exactly this parameter set."""
+
+        return (
+            int(self.parameter_generation) == parameter_set.generation
+            and self.digest == parameter_set.digest
+        )
+
     def as_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "token": self.token,
             "scope": self.scope,
+            "parameter_generation": int(self.parameter_generation),
+            "digest": self.digest,
             "issued_at": float(self.issued_at),
             "expires_at": float(self.expires_at),
             "issued_by": self.issued_by,
@@ -64,6 +76,8 @@ class Confirmation:
         return cls(
             token=str(payload.get("token", "")),
             scope=str(payload.get("scope", "")),
+            parameter_generation=int(payload.get("parameter_generation", 0)),
+            digest=str(payload.get("digest", "")),
             issued_at=float(payload.get("issued_at", 0.0)),
             expires_at=float(payload.get("expires_at", 0.0)),
             issued_by=str(payload.get("issued_by", "")),
@@ -118,6 +132,8 @@ class ConfirmationBook:
         confirmation = Confirmation(
             token=token,
             scope=label,
+            parameter_generation=parameter_set.generation,
+            digest=parameter_set.digest,
             issued_at=float(issued_at),
             expires_at=float(issued_at) + lifetime,
             issued_by=str(issued_by),
@@ -157,6 +173,15 @@ class ConfirmationBook:
                 expected=confirmation.scope,
                 actual=str(scope),
             )
+        if parameter_set is not None and not confirmation.binds(parameter_set):
+            raise GenerationMismatch(
+                "confirmation slip was signed against a superseded parameter generation",
+                token=confirmation.token,
+                slip_generation=confirmation.parameter_generation,
+                slip_digest=confirmation.digest,
+                current_generation=parameter_set.generation,
+                current_digest=parameter_set.digest,
+            )
         return confirmation
 
     def revoke(self, token: str, *, at: float) -> Confirmation:
@@ -164,6 +189,8 @@ class ConfirmationBook:
         revoked = Confirmation(
             token=confirmation.token,
             scope=confirmation.scope,
+            parameter_generation=confirmation.parameter_generation,
+            digest=confirmation.digest,
             issued_at=confirmation.issued_at,
             expires_at=confirmation.expires_at,
             issued_by=confirmation.issued_by,
@@ -199,6 +226,8 @@ class ConfirmationBook:
     ) -> str:
         material = {
             "scope": scope,
+            "parameter_generation": parameter_set.generation,
+            "digest": parameter_set.digest,
             "issued_at": issued_at,
             "issued_by": issued_by,
             "issued": len(self._entries),
